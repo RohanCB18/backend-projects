@@ -1,0 +1,20 @@
+# OPTIONAL. Nothing in the default setup needs Docker: every project stores its
+# state in SQLite or builds the infrastructure itself (that's the point of 04/05).
+#
+# This only provides Redis for 01-rate-limiter's alternative backend:
+#   docker compose up -d
+#   set RL_BACKEND=redis   (PowerShell: $env:RL_BACKEND="redis")   then start 01
+name: backend-mastery
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports: ["6380:6379"]   # 6380, so it never clashes with another Redis on 6379
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+volumes:
+  redis-data:
