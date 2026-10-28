@@ -14,11 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .handlers import HANDLERS
-from .queue import JobQueue
+from .queue import DEFAULT_DSN, JobQueue
 from .worker import WorkerPool
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.getenv("JQ_DB", os.path.join(HERE, "data", "jobqueue.db"))
+DSN = os.getenv("JQ_DSN", DEFAULT_DSN)
+SCHEMA = os.getenv("JQ_SCHEMA", "public")
 LEASE = float(os.getenv("JQ_LEASE", "5"))
 BACKOFF = float(os.getenv("JQ_BACKOFF", "1"))
 
@@ -28,7 +29,7 @@ async def lifespan(app: FastAPI):
     if sys.platform == "win32":
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
-    q = JobQueue(DB, lease_seconds=LEASE, base_backoff=BACKOFF)
+    q = JobQueue(DSN, lease_seconds=LEASE, base_backoff=BACKOFF, schema=SCHEMA)
     app.state.q = q
     app.state.pool = WorkerPool(q)
     app.state.procs: dict[str, subprocess.Popen] = {}
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     app.state.pool.shutdown()
     for p in app.state.procs.values():
         p.kill()
+    q.store.close()
 
 
 app = FastAPI(title="02 Reliable Job Queue", lifespan=lifespan)
@@ -151,7 +153,8 @@ async def spawn_process_worker(request: Request):
     procs = request.app.state.procs
     wid = f"proc-{len(procs) + 1}-{int(time.time()) % 10000}"
     procs[wid] = subprocess.Popen(
-        [sys.executable, "-m", "app.worker", "--id", wid, "--db", DB, "--lease", str(LEASE), "--backoff", str(BACKOFF)],
+        [sys.executable, "-m", "app.worker", "--id", wid, "--dsn", DSN, "--schema", SCHEMA,
+         "--lease", str(LEASE), "--backoff", str(BACKOFF)],
         cwd=HERE,
     )
     return {"spawned": wid, "pid": procs[wid].pid}

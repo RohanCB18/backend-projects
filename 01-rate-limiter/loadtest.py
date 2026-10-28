@@ -22,7 +22,7 @@ def main() -> int:
     p.add_argument("--key", default="loadtest")
     p.add_argument("--rps", type=int, default=600)
     p.add_argument("--duration", type=float, default=5)
-    p.add_argument("--procs", type=int, default=2)
+    p.add_argument("--procs", type=int, default=1)
     p.add_argument("--mode", default="token_bucket", choices=["token_bucket", "sliding_window"])
     p.add_argument("--rate", type=float, default=50)
     p.add_argument("--burst", type=int, default=100)

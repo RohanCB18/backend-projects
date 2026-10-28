@@ -1,4 +1,4 @@
-"""Types shared by both storage backends (SQLite default, Redis optional)."""
+"""Config defaults and the Decision type returned by the limiter."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -15,6 +15,7 @@ class Decision:
     reset: float        # seconds until the full limit is available again
     mode: str
     server_time: float
+    seq: int = 0        # this client's decision number: the exact execution order
 
     def headers(self) -> dict[str, str]:
         h = {

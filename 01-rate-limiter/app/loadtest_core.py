@@ -4,16 +4,20 @@ Used by `python loadtest.py` and by the /loadtest endpoint (which runs it in a
 separate process so the generator doesn't steal CPU from the server).
 
 How correctness is proven:
-  1. Replay. Every response carries the server's decision time. We sort the
-     requests by that time and run them through a tiny reference model of the
-     algorithm (a few lines of plain Python below). The service's ALLOW/DENY
-     must match the model's request by request. This holds whatever the
-     arrival pattern, and catches both double-spends and wrongful denies.
+  1. Replay. Every response carries the decision's sequence number for that
+     client (assigned inside Redis's atomic script, so it IS the execution
+     order) and the time the script used. We replay the requests in that order
+     through a tiny reference model of the algorithm (a few lines of plain
+     Python below). The service's ALLOW/DENY must match the model's request by
+     request. This holds whatever the arrival pattern, and catches both
+     double-spends and wrongful denies.
   2. Invariant. Token bucket: allowed <= burst + rate x span. Sliding window:
      no window of `window` seconds contains more than `limit` ALLOWs.
 
-The load is split across OS processes, each with its own event loop, because
-one Python process on Windows tops out around 500-600 req/s of client traffic.
+One generator process (aiohttp, 32 pre-opened connections) sends ~600 req/s.
+`--procs N` splits the load across N processes for higher rates, but on
+Windows several processes holding many loopback connections at once tend to
+trigger multi-second TCP stalls, so one process is the default.
 """
 from __future__ import annotations
 
@@ -55,7 +59,7 @@ def _init(barrier) -> None:
 async def _run_one(base_url: str, key: str, rps: float, duration: float) -> dict:
     total = int(rps * duration)
     interval = 1.0 / rps
-    results: list[tuple[int, float]] = []
+    results: list[tuple[bool, float, int]] = []
     errors: dict[str, int] = {}
     # A fixed pool of connections, all opened BEFORE the clock starts. Opening
     # them on demand (or all at once) produces bursts of new TCP connects, and
@@ -75,7 +79,7 @@ async def _run_one(base_url: str, key: str, rps: float, duration: float) -> dict
             try:
                 async with s.get(f"/check/{key}") as r:
                     d = await r.json()
-                    results.append((d["decision"] == "ALLOW", d["server_time"]))
+                    results.append((d["decision"] == "ALLOW", d["server_time"], d["seq"]))
             except Exception as e:
                 errors[type(e).__name__] = errors.get(type(e).__name__, 0) + 1
 
@@ -98,7 +102,7 @@ def _proc_entry(args) -> dict:
     return asyncio.run(_run_one(*args))
 
 
-def run_load(base_url: str, key: str, rps: int, duration: float, procs: int = 2) -> dict:
+def run_load(base_url: str, key: str, rps: int, duration: float, procs: int = 1) -> dict:
     ctx = multiprocessing.get_context("spawn")
     barrier = ctx.Barrier(procs)
     t0 = time.time()
@@ -111,7 +115,7 @@ def run_load(base_url: str, key: str, rps: int, duration: float, procs: int = 2)
         for k, v in p["errors"].items():
             error_types[k] = error_types.get(k, 0) + v
     errors = sum(error_types.values())
-    times = sorted(t for _, t in results)
+    times = sorted(t for _, t, _ in results)
     server_span = (times[-1] - times[0]) if times else 0.0
     sent = int(rps / procs * duration) * procs
     return {
@@ -150,12 +154,12 @@ def _replay_sliding_window(times: list[float], limit: int, window: float) -> lis
     return out
 
 
-def verify(results: list[tuple[bool, float]], cfg: dict) -> dict:
+def verify(results: list[tuple[bool, float, int]], cfg: dict) -> dict:
     if not results:
         return {"ok": False, "reason": "no results"}
-    ordered = sorted(results, key=lambda r: r[1])
-    times = [t for _, t in ordered]
-    actual = [bool(ok) for ok, _ in ordered]
+    ordered = sorted(results, key=lambda r: r[2])  # execution order
+    times = [t for _, t, _ in ordered]
+    actual = [bool(ok) for ok, _, _ in ordered]
     span = times[-1] - times[0]
     allowed = sum(actual)
     out = {"requests": len(results), "allowed": allowed, "denied": len(results) - allowed, "span": span}

@@ -1,6 +1,4 @@
-"""Optional Redis storage backend (set RL_BACKEND=redis).
-
-Same behaviour as the SQLite backend; kept to show the classic Redis approach.
+"""Core rate-limiting logic, stored in Redis.
 
 Design decision: every decision runs as ONE Lua script inside Redis.
 Redis executes a script atomically (no other command runs in between), so
@@ -24,7 +22,7 @@ from redis.asyncio import Redis
 from .core import DEFAULT_CONFIG, Decision
 
 DECIDE_LUA = """
--- KEYS: 1 bucket hash, 2 window zset, 3 config hash, 4 stats key prefix
+-- KEYS: 1 bucket hash, 2 window zset, 3 config hash, 4 stats key prefix, 5 sequence counter
 -- ARGV: 1 client, 2 cost, 3 unique member id, 4 default config (json)
 local client = ARGV[1]
 local cost   = tonumber(ARGV[2])
@@ -38,6 +36,14 @@ end
 local t = redis.call('TIME')
 local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 
+-- tostring() keeps only 14 significant digits, which would round a timestamp
+-- like 1793185568.123456 to 0.1 ms. Always write numbers at full precision.
+local function num(x) return string.format('%.17g', x) end
+
+-- Position of this decision among all decisions for this client: the exact
+-- execution order, which the load test replays (clocks can't be trusted for that).
+local seq = redis.call('INCR', KEYS[5])
+
 local allowed, remaining, retry_after, reset, limit = 0, 0, 0, 0, 0
 
 if cfg.mode == 'sliding_window' then
@@ -45,6 +51,9 @@ if cfg.mode == 'sliding_window' then
   -- Drop everything older than the window, then count what is left.
   limit = tonumber(cfg.limit)
   local window = tonumber(cfg.window)
+  -- Never let this client's clock run backwards (see the token bucket below).
+  local newest = redis.call('ZRANGE', KEYS[2], -1, -1, 'WITHSCORES')
+  if newest[2] and tonumber(newest[2]) > now then now = tonumber(newest[2]) end
   redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - window)
   local count = redis.call('ZCARD', KEYS[2])
   if count + cost <= limit then
@@ -66,12 +75,16 @@ else
   local tokens = tonumber(data[1])
   local ts = tonumber(data[2])
   if tokens == nil then tokens = burst; ts = now end   -- new client: full bucket
-  tokens = math.min(burst, tokens + math.max(0, now - ts) * rate)
+  -- Redis's clock can step backwards a little (e.g. a VM syncing its time).
+  -- Storing that earlier time would count the same milliseconds twice once the
+  -- clock recovers, handing out extra tokens. So time only moves forward here.
+  if now < ts then now = ts end
+  tokens = math.min(burst, tokens + (now - ts) * rate)
   if tokens >= cost then
     tokens = tokens - cost
     allowed = 1
   end
-  redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+  redis.call('HSET', KEYS[1], 'tokens', num(tokens), 'ts', num(now))
   -- once the bucket would be full again, "no state" means the same thing
   redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) + 60)
   remaining = tokens
@@ -86,12 +99,11 @@ redis.call('EXPIRE', KEYS[4] .. t[1], 120)
 redis.call('HINCRBY', KEYS[4] .. 'total', field, 1)
 
 -- Lua numbers become integers in replies, so floats travel as strings
-return {allowed, tostring(remaining), tostring(retry_after), tostring(reset), tostring(now), limit, cfg.mode}
+return {allowed, num(remaining), num(retry_after), num(reset), num(now), limit, cfg.mode, seq}
 """
 
 
-
-class RedisLimiter:
+class RateLimiter:
     def __init__(self, redis: Redis, prefix: str = "rl:"):
         self.r = redis
         self.p = prefix
@@ -122,8 +134,9 @@ class RedisLimiter:
 
     # ---- the decision (requirement 1) --------------------------------------
     async def check(self, client: str, cost: int = 1) -> Decision:
-        allowed, remaining, retry_after, reset, now, limit, mode = await self._decide(
-            keys=[f"{self.p}tb:{client}", f"{self.p}sw:{client}", f"{self.p}cfg", f"{self.p}stats:"],
+        allowed, remaining, retry_after, reset, now, limit, mode, seq = await self._decide(
+            keys=[f"{self.p}tb:{client}", f"{self.p}sw:{client}", f"{self.p}cfg", f"{self.p}stats:",
+                  f"{self.p}seq:{client}"],
             args=[client, cost, uuid.uuid4().hex, self._default],
         )
         return Decision(
@@ -134,6 +147,7 @@ class RedisLimiter:
             reset=float(reset),
             mode=mode,
             server_time=float(now),
+            seq=int(seq),
         )
 
     async def peek(self, client: str) -> dict:

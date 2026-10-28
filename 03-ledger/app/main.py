@@ -17,10 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .ledger import RATES_TO_INR, Ledger, Rejected
+from .ledger import DEFAULT_DSN, RATES_TO_INR, Ledger, Rejected
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.getenv("LEDGER_DB", os.path.join(HERE, "data", "ledger.db"))
+DSN = os.getenv("LEDGER_DSN", DEFAULT_DSN)
+SCHEMA = os.getenv("LEDGER_SCHEMA", "public")
 
 
 @asynccontextmanager
@@ -28,8 +28,9 @@ async def lifespan(app: FastAPI):
     if sys.platform == "win32":
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
-    app.state.ledger = Ledger(DB)
+    app.state.ledger = Ledger(DSN, schema=SCHEMA)
     yield
+    app.state.ledger.store.close()
 
 
 app = FastAPI(title="03 Event-Sourced Ledger", lifespan=lifespan)

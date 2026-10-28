@@ -2,9 +2,6 @@
 __pycache__/
 .pytest_cache/
 */data/
-*.db
-*.db-wal
-*.db-shm
 frontend/node_modules/
 frontend/dist/
 .logs/

@@ -2,7 +2,9 @@
 
 Google-Docs-style live editing on a hand-written **RGA sequence CRDT**, with
 the same algorithm in Python (`app/rga.py`, server) and JavaScript
-(`../frontend/src/lib/rga.js`, every browser client).
+(`../frontend/src/lib/rga.js`, every browser client). The operation log lives
+in Postgres (`docker compose up -d --wait` in the repo root; database `collab`
+on 127.0.0.1:15432, or set `COLLAB_DSN`).
 
 ```bash
 ..\.venv\Scripts\python -m uvicorn app.main:app --port 9104
@@ -37,6 +39,11 @@ pending buffer, which is what makes offline merging work.
 * History: the op log is the document. `GET /docs/{doc}/at/{seq}` replays it;
   `POST /docs/{doc}/revert {seq}` computes the edits that turn "now" into
   "then" and applies them as **new** ops, so a revert can itself be reverted.
+* Storage: every op-log access runs on **one** dedicated database thread, in
+  arrival order. Database calls never block the WebSocket event loop, appends
+  never interleave (sequence numbers stay gap-free), and the in-memory replicas
+  are only touched by one thread. (psycopg's async mode also doesn't work on
+  Windows' default event loop, so the thread is the portable choice.)
 
 ## How each requirement is proven
 
@@ -46,7 +53,7 @@ pending buffer, which is what makes offline merging work.
 | R2 own CRDT | `app/rga.py` + `rga.js`, no library; `test_r2_concurrent_inserts_at_the_same_spot_are_ordered_identically` |
 | R3 offline merge | `test_r3_offline_client_merges_without_losing_anyones_work`; "Offline merge" button |
 | R4 history + revert | `test_r4_revert_to_any_point_and_revert_the_revert`, `test_r4_history_survives_server_restart`, HTTP revert broadcast test |
-| R5 sub-second broadcast | `test_r5_edits_reach_other_clients_in_well_under_a_second` (real sockets, ~2–3 ms) |
+| R5 sub-second broadcast | `test_r5_edits_reach_other_clients_in_well_under_a_second` (real sockets, ~10 ms including the durable Postgres write) |
 | R6 convergence proof | Hypothesis property tests: 300 random 3-replica histories with partial gossip and shuffled delivery, plus 100 permutation tests. `test_python_and_javascript_crdts_agree` runs the JS CRDT in Node on 40 random histories and checks it matches Python character for character |
 | R7 disconnect mid-edit | `test_r3_r7_disconnect_mid_edit_then_reconnect_no_loss_no_duplicates`, `test_r7_resent_ops_are_stored_once`; "drop mid-edit" button |
 | Stretch | presence channel with live cursors (`test_stretch_presence_channel_reports_peers_and_cursors`) |

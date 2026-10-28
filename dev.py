@@ -4,8 +4,10 @@
     python dev.py 1 4        only backends 01 and 04 (+ frontend)
     python dev.py --no-ui    backends only
 
-Ctrl+C stops everything (whole process trees, including uvicorn workers and
-cache nodes).
+Projects 01-04 need Redis/Postgres: dev.py starts them with
+`docker compose up -d --wait` first (Docker Desktop must be running).
+Ctrl+C stops the services (whole process trees, including cache nodes); the
+Redis/Postgres containers keep running (`docker compose stop` stops them).
 """
 from __future__ import annotations
 
@@ -31,6 +33,31 @@ SERVICES = {
     5: ("05-distributed-cache", 9105, []),  # the controller; it starts nodes on 9201+
 }
 COLORS = {1: "33", 2: "35", 3: "32", 4: "36", 5: "31", "ui": "34"}
+NEEDS_INFRA = {1, 2, 3, 4}  # 05 is the cache you build yourself: no Redis there
+
+DOCKER_HELP = r"""
+!! Docker isn't reachable, and projects 01-04 need Redis + Postgres from it.
+   1. Start Docker Desktop and wait until it says it's running, then re-run dev.py.
+   2. If Docker Desktop shows "An unexpected error occurred ... dockerInference",
+      quit it, rename the folder  %LOCALAPPDATA%\Docker\run  (e.g. to run_old),
+      and start Docker Desktop again. Docker recreates the folder.
+   3. Or run only the project that needs nothing:  python dev.py 5
+"""
+
+
+def start_infra() -> bool:
+    print("   starting Redis + Postgres (docker compose up -d --wait) ...")
+    try:
+        r = subprocess.run(["docker", "compose", "up", "-d", "--wait"], cwd=ROOT,
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"   docker compose failed: {e}")
+        return False
+    if r.returncode != 0:
+        print(r.stderr.strip()[-800:])
+        return False
+    print("   Redis on 127.0.0.1:16380, Postgres on 127.0.0.1:15432")
+    return True
 
 
 def port_busy(port: int) -> bool:
@@ -75,6 +102,9 @@ def main() -> int:
     if PY == sys.executable and not os.path.exists(VENV_PY):
         print("note: no .venv found, using this Python. Create one with:\n"
               "  python -m venv .venv && .venv\\Scripts\\pip install -r requirements.txt")
+    if NEEDS_INFRA & set(picked) and not start_infra():
+        print(DOCKER_HELP)
+        return 1
     procs = []
     for n in picked:
         folder, port, extra = SERVICES[n]

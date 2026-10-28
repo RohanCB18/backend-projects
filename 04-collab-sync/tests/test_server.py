@@ -6,23 +6,27 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import httpx
+import psycopg
 import pytest
 import websockets
 
 from app.rga import RGA, op_key
+from app.store import DEFAULT_DSN
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture(scope="module")
-def server(tmp_path_factory):
+def server():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
-    env = {**os.environ, "COLLAB_DB": str(tmp_path_factory.mktemp("c") / "c.db")}
+    schema = f"test_{uuid.uuid4().hex[:10]}"
+    env = {**os.environ, "COLLAB_SCHEMA": schema}
     proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port),
                              "--log-level", "warning"], cwd=ROOT, env=env)
     for _ in range(100):
@@ -34,6 +38,8 @@ def server(tmp_path_factory):
     yield f"127.0.0.1:{port}"
     proc.terminate()
     proc.wait()
+    with psycopg.connect(os.getenv("COLLAB_DSN", DEFAULT_DSN), autocommit=True) as con:
+        con.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 class Client:

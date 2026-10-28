@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -30,10 +31,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .rga import op_key
-from .store import DocStore
+from .store import DEFAULT_DSN, DocStore
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.getenv("COLLAB_DB", os.path.join(HERE, "data", "collab.db"))
+DSN = os.getenv("COLLAB_DSN", DEFAULT_DSN)
+SCHEMA = os.getenv("COLLAB_SCHEMA", "public")
+
+# Every op-log access runs on this ONE thread, in arrival order: database calls
+# never block the event loop, appends never interleave (so sequence numbers stay
+# gap-free), and the in-memory documents are only ever touched by one thread.
+_db = ThreadPoolExecutor(max_workers=1, thread_name_prefix="oplog")
+
+
+async def db(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_db, fn, *args)
 
 
 class Hub:
@@ -58,9 +68,10 @@ class Hub:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.store = DocStore(DB)
+    app.state.store = await db(DocStore, DSN, SCHEMA)
     app.state.hub = Hub()
     yield
+    await db(app.state.store.close)
 
 
 app = FastAPI(title="04 Collaborative Sync Engine", lifespan=lifespan)
@@ -78,13 +89,12 @@ async def edit_socket(ws: WebSocket, doc: str, site: str, name: str = ""):
         while True:
             msg = await ws.receive_json()
             if msg["type"] == "hello":
-                store.doc(doc)
-                await hub.send(ws, {"type": "sync", "ops": store.since(doc, int(msg.get("since", 0))),
-                                    "seq": store.seq[doc]})
+                missed, seq = await db(lambda: (store.since(doc, int(msg.get("since", 0))), store.seq[doc]))
+                await hub.send(ws, {"type": "sync", "ops": missed, "seq": seq})
             elif msg["type"] == "ops":
-                fresh = store.append(doc, msg["ops"])
+                fresh, seq = await db(lambda: (store.append(doc, msg["ops"]), store.seq[doc]))
                 # ack everything, including duplicates, so the client can empty its outbox
-                await hub.send(ws, {"type": "ack", "keys": [op_key(o) for o in msg["ops"]], "seq": store.seq[doc]})
+                await hub.send(ws, {"type": "ack", "keys": [op_key(o) for o in msg["ops"]], "seq": seq})
                 if fresh:
                     await hub.broadcast(doc, {"type": "ops", "ops": fresh}, exclude=ws)
     except WebSocketDisconnect:
@@ -123,22 +133,31 @@ async def presence_socket(ws: WebSocket, doc: str, site: str, name: str = "", co
 @app.get("/docs/{doc}")
 async def get_doc(doc: str, request: Request):
     store: DocStore = request.app.state.store
-    d = store.doc(doc)
-    return {"doc": doc, "text": d.text(), "seq": store.seq[doc], "chars": len(d.elems),
-            "tombstones": sum(e.deleted for e in d.elems), "clients": request.app.state.hub.peers(doc)}
+
+    def read():
+        d = store.doc(doc)
+        return {"doc": doc, "text": d.text(), "seq": store.seq[doc], "chars": len(d.elems),
+                "tombstones": sum(e.deleted for e in d.elems)}
+
+    return {**await db(read), "clients": request.app.state.hub.peers(doc)}
 
 
 @app.get("/docs/{doc}/history")
 async def history(doc: str, request: Request):
     store: DocStore = request.app.state.store
-    store.doc(doc)
-    return {"seq": store.seq[doc], "edits": store.history(doc)}
+
+    def read():
+        store.doc(doc)
+        return {"seq": store.seq[doc], "edits": store.history(doc)}
+
+    return await db(read)
 
 
 @app.get("/docs/{doc}/at/{seq}")
 async def at(doc: str, seq: int, request: Request):
     """R4: the document as it was after operation number `seq`."""
-    return {"seq": seq, "text": request.app.state.store.at(doc, seq).text()}
+    store: DocStore = request.app.state.store
+    return {"seq": seq, "text": await db(lambda: store.at(doc, seq).text())}
 
 
 class RevertIn(BaseModel):
@@ -150,19 +169,23 @@ async def revert(doc: str, body: RevertIn, request: Request):
     """R4: revert = compute the edits that turn 'now' into 'then' and apply them
     as NEW ops. Nothing is erased from history, so a revert can be reverted."""
     store: DocStore = request.app.state.store
-    store.doc(doc)
-    current = store.at(doc, store.seq[doc])
-    current.site = "server"
-    ops = current.ops_to_become(store.at(doc, body.seq), site="revert")
-    fresh = store.append(doc, ops)
+
+    def do_revert():
+        store.doc(doc)
+        current = store.at(doc, store.seq[doc])
+        current.site = "server"
+        fresh = store.append(doc, current.ops_to_become(store.at(doc, body.seq), site="revert"))
+        return fresh, store.doc(doc).text(), store.seq[doc]
+
+    fresh, text, seq = await db(do_revert)
     if fresh:
         await request.app.state.hub.broadcast(doc, {"type": "ops", "ops": fresh})
-    return {"applied": len(fresh), "text": store.doc(doc).text(), "seq": store.seq[doc]}
+    return {"applied": len(fresh), "text": text, "seq": seq}
 
 
 @app.post("/docs/{doc}/reset")
 async def reset(doc: str, request: Request):
-    request.app.state.store.reset(doc)
+    await db(request.app.state.store.reset, doc)
     await request.app.state.hub.broadcast(doc, {"type": "reset"})
     return {"ok": True}
 

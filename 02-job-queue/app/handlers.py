@@ -74,7 +74,7 @@ def send_email(ctx: Ctx, p: dict) -> dict:
     ctx.work(float(p.get("duration", 1.0)) / 2)
     # keyed by job id: a retried job never sends the same email twice
     ctx.queue.store.tx(lambda con: con.execute(
-        "INSERT INTO emails (recipient, job_id, attempt, ts, idempotency_key) VALUES (?, ?, ?, ?, ?) "
+        "INSERT INTO emails (recipient, job_id, attempt, ts, idempotency_key) VALUES (%s, %s, %s, %s, %s) "
         "ON CONFLICT (idempotency_key) DO NOTHING",
         (p.get("to", "user@example.com"), ctx.job["id"], ctx.attempt, time.time(), f"email:{ctx.job['id']}")))
     return {"sent_to": p.get("to", "user@example.com")}
@@ -114,7 +114,7 @@ def _charge(ctx: Ctx, p: dict, idempotent: bool) -> dict:
     key = f"charge:{order}" if idempotent else None
     inserted = ctx.queue.store.tx(lambda con: con.execute(
         "INSERT INTO charges (order_id, amount, job_id, attempt, worker, ts, idempotency_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (idempotency_key) DO NOTHING",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING",
         (order, amount, ctx.job["id"], ctx.attempt, ctx.worker.id, time.time(), key)).rowcount)
     if inserted:
         ctx.log(f"charged order {order}: Rs {amount:g}")

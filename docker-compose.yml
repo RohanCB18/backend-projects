@@ -1,20 +1,38 @@
-# OPTIONAL. Nothing in the default setup needs Docker: every project stores its
-# state in SQLite or builds the infrastructure itself (that's the point of 04/05).
+# Infrastructure for the projects (start it with: docker compose up -d --wait)
+#   redis    -> 01-rate-limiter (bucket state; AOF on, so it survives restarts)
+#   postgres -> 02-job-queue, 03-ledger, 04-collab-sync (one database each)
+# 05 needs nothing: building a Redis-like cache yourself is the point of it.
 #
-# This only provides Redis for 01-rate-limiter's alternative backend:
-#   docker compose up -d
-#   set RL_BACKEND=redis   (PowerShell: $env:RL_BACKEND="redis")   then start 01
+# Host ports are 16380 / 15432 (not the default 6379 / 5432) so they never
+# clash with a Redis or PostgreSQL already installed on the machine.
 name: backend-mastery
 services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    ports: ["6380:6379"]   # 6380, so it never clashes with another Redis on 6379
+    ports: ["16380:6379"]
     volumes: ["redis-data:/data"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       retries: 30
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: backend
+      POSTGRES_PASSWORD: backend
+      POSTGRES_DB: backend
+    command: ["postgres", "-c", "max_connections=300"]
+    ports: ["15432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "backend"]
+      interval: 2s
+      retries: 30
+
 volumes:
   redis-data:
+  pg-data:

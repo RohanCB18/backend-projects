@@ -25,7 +25,7 @@ export default function Home({ onOpen, health }) {
           <span className="badge neutral">
             <Terminal size={12} /> python dev.py
           </span>
-          <span className="badge neutral">no Docker required</span>
+          <span className="badge neutral">Redis + Postgres via Docker</span>
         </div>
       </section>
 

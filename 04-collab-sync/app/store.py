@@ -1,27 +1,35 @@
-"""Durable operation log (append-only) + the live documents rebuilt from it.
+"""Durable operation log (append-only, in Postgres) + the live documents rebuilt from it.
 
 The op log IS the document: every insert/delete ever made, in server order.
   * history / time travel (R4): replay the log up to sequence N
   * reconnecting clients: "send me everything after seq N"
   * dedupe (R7): UNIQUE(doc, op_key) means a resent op is stored once
+
+This class is NOT thread-safe on purpose: the server calls it from one
+dedicated thread only (see main.py), which also keeps sequence numbers
+gap-free without any locking.
 """
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
 import time
+import zlib
+
+import psycopg
+from psycopg.rows import dict_row
 
 from .rga import RGA, op_key
+
+DEFAULT_DSN = "postgresql://backend:backend@127.0.0.1:15432/collab"  # docker-compose.yml
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ops (
     doc    TEXT NOT NULL,
-    seq    INTEGER NOT NULL,
+    seq    BIGINT NOT NULL,
     op_key TEXT NOT NULL,
     site   TEXT NOT NULL,
-    op     TEXT NOT NULL,
-    ts     REAL NOT NULL,
+    op     JSONB NOT NULL,
+    ts     DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (doc, seq),
     UNIQUE (doc, op_key)
 );
@@ -29,23 +37,26 @@ CREATE TABLE IF NOT EXISTS ops (
 
 
 class DocStore:
-    def __init__(self, path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        # The server touches the log only from the event-loop thread, so one connection is enough.
-        self.con = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.con.execute("PRAGMA journal_mode=WAL")
-        self.con.execute("PRAGMA synchronous=NORMAL")
-        self.con.executescript(SCHEMA)
+    def __init__(self, dsn: str = DEFAULT_DSN, schema: str = "public"):
+        with psycopg.connect(dsn, autocommit=True) as con:
+            con.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        self.con = psycopg.connect(dsn, autocommit=True, row_factory=dict_row, options=f"-c search_path={schema}")
+        with self.con.transaction():
+            self.con.execute("SELECT pg_advisory_xact_lock(%s)", (zlib.crc32(schema.encode()),))
+            self.con.execute(SCHEMA)
         self.docs: dict[str, RGA] = {}
         self.seq: dict[str, int] = {}
+
+    def close(self) -> None:
+        self.con.close()
 
     def doc(self, name: str) -> RGA:
         if name not in self.docs:
             d = RGA("server")
             seq = 0
-            for (op, s) in self.con.execute("SELECT op, seq FROM ops WHERE doc = ? ORDER BY seq", (name,)):
-                d.apply(json.loads(op))
-                seq = s
+            for row in self.con.execute("SELECT op, seq FROM ops WHERE doc = %s ORDER BY seq", (name,)):
+                d.apply(row["op"])
+                seq = row["seq"]
             self.docs[name], self.seq[name] = d, seq
         return self.docs[name]
 
@@ -55,44 +66,44 @@ class DocStore:
         d = self.doc(name)
         fresh = []
         now = time.time()
-        self.con.execute("BEGIN")
+        seq = self.seq[name]
         try:
-            for op in ops:
-                key = op_key(op)
-                seq = self.seq[name] + 1
-                cur = self.con.execute(
-                    "INSERT OR IGNORE INTO ops (doc, seq, op_key, site, op, ts) VALUES (?, ?, ?, ?, ?, ?)",
-                    (name, seq, key, op["id"][1], json.dumps(op), now))
-                if cur.rowcount == 0:
-                    continue  # already have it
-                self.seq[name] = seq
-                d.apply(op)
-                fresh.append({**op, "seq": seq})
-            self.con.execute("COMMIT")
+            with self.con.transaction():
+                for op in ops:
+                    cur = self.con.execute(
+                        "INSERT INTO ops (doc, seq, op_key, site, op, ts) VALUES (%s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (doc, op_key) DO NOTHING",
+                        (name, seq + 1, op_key(op), op["id"][1], psycopg.types.json.Jsonb(op), now))
+                    if cur.rowcount == 0:
+                        continue  # already have it
+                    seq += 1
+                    fresh.append({**op, "seq": seq})
         except BaseException:
-            self.con.execute("ROLLBACK")
             self.docs.pop(name, None)  # rebuild from the log next time
             raise
+        # only touch the in-memory document once the ops are safely committed
+        for op in fresh:
+            d.apply(op)
+        self.seq[name] = seq
         return fresh
 
     def since(self, name: str, seq: int) -> list[dict]:
         self.doc(name)
-        return [{**json.loads(op), "seq": s} for op, s in
-                self.con.execute("SELECT op, seq FROM ops WHERE doc = ? AND seq > ? ORDER BY seq", (name, seq))]
+        return [{**r["op"], "seq": r["seq"]} for r in
+                self.con.execute("SELECT op, seq FROM ops WHERE doc = %s AND seq > %s ORDER BY seq", (name, seq))]
 
     def at(self, name: str, seq: int) -> RGA:
         """The document exactly as it was after op number `seq`."""
         d = RGA("history")
-        for (op,) in self.con.execute("SELECT op FROM ops WHERE doc = ? AND seq <= ? ORDER BY seq", (name, seq)):
-            d.apply(json.loads(op))
+        for r in self.con.execute("SELECT op FROM ops WHERE doc = %s AND seq <= %s ORDER BY seq", (name, seq)):
+            d.apply(r["op"])
         return d
 
     def history(self, name: str) -> list[dict]:
         """Ops grouped into edits: consecutive ops by the same site within 1.5 s."""
         groups: list[dict] = []
-        for op, seq, site, ts in self.con.execute(
-                "SELECT op, seq, site, ts FROM ops WHERE doc = ? ORDER BY seq", (name,)):
-            o = json.loads(op)
+        for r in self.con.execute("SELECT op, seq, site, ts FROM ops WHERE doc = %s ORDER BY seq", (name,)):
+            o, seq, site, ts = r["op"], r["seq"], r["site"], r["ts"]
             g = groups[-1] if groups else None
             if g and g["site"] == site and ts - g["ts_end"] < 1.5:
                 g["seq_end"], g["ts_end"] = seq, ts
@@ -106,6 +117,6 @@ class DocStore:
         return groups
 
     def reset(self, name: str) -> None:
-        self.con.execute("DELETE FROM ops WHERE doc = ?", (name,))
+        self.con.execute("DELETE FROM ops WHERE doc = %s", (name,))
         self.docs.pop(name, None)
         self.seq.pop(name, None)

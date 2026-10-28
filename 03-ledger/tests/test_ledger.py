@@ -1,24 +1,40 @@
 """One test (or more) per requirement R1..R7, plus both stretch goals."""
 import multiprocessing as mp
+import os
 import random
-import sqlite3
 import threading
 import time
+import uuid
+from typing import NamedTuple
 
 import httpx
+import psycopg
 import pytest
 
-from app.ledger import SNAPSHOT_EVERY, Leg, Ledger, Rejected
+from app.ledger import DEFAULT_DSN, SNAPSHOT_EVERY, Leg, Ledger, Rejected
+
+DSN = os.getenv("LEDGER_DSN", DEFAULT_DSN)
+
+
+class Db(NamedTuple):
+    dsn: str
+    schema: str
 
 
 @pytest.fixture
-def db(tmp_path):
-    return str(tmp_path / "ledger.db")
+def db():
+    """A fresh Postgres schema per test: same tables and triggers, nothing shared."""
+    d = Db(DSN, f"test_{uuid.uuid4().hex[:10]}")
+    yield d
+    with psycopg.connect(DSN, autocommit=True) as con:
+        con.execute(f'DROP SCHEMA IF EXISTS "{d.schema}" CASCADE')
 
 
 @pytest.fixture
 def L(db):
-    return Ledger(db)
+    led = Ledger(db.dsn, schema=db.schema)
+    yield led
+    led.store.close()
 
 
 def acct(L, name, **kw):
@@ -29,18 +45,18 @@ def acct(L, name, **kw):
 def test_r1_history_cannot_be_rewritten(L):
     a = acct(L, "Alice")
     L.deposit(a, 100)
-    con = L.store.con()
-    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
-        con.execute("UPDATE entries SET amount = 999999")
-    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
-        con.execute("DELETE FROM entries")
-    with pytest.raises(sqlite3.DatabaseError, match="immutable"):
-        con.execute("UPDATE transactions SET description = 'nothing to see here'")
+    for sql in ("UPDATE entries SET amount = 999999", "DELETE FROM entries", "TRUNCATE entries CASCADE",
+                "UPDATE transactions SET description = 'nothing to see here'"):
+        with pytest.raises(psycopg.errors.RaiseException, match="immutable"):
+            L.store.tx(lambda con: con.execute(sql))
     assert L.account(a)["balance"] == 10000
 
 
 def test_r1_there_is_no_balance_column_to_update(L):
-    cols = [r[1] for r in L.store.con().execute("PRAGMA table_info(accounts)")]
+    cols = [r["column_name"] for r in L.store.query(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'accounts'")]
+    assert "kind" in cols
     assert "balance" not in cols
 
 
@@ -67,7 +83,7 @@ def test_r3_balance_is_the_fold_of_events(L):
     L.deposit(a, 1000)
     L.transfer(a, b, 250.75)
     L.withdraw(a, 100)
-    events = [r["amount"] for r in L.store.query("SELECT amount FROM entries WHERE account_id = ?", (a,))]
+    events = [r["amount"] for r in L.store.query("SELECT amount FROM entries WHERE account_id = %s ORDER BY version", (a,))]
     assert events == [100000, -25075, -10000]
     assert L.account(a)["balance"] == sum(events) == 64925
     assert L.balance_full_replay(a) == 64925
@@ -90,7 +106,7 @@ async def test_r4_point_in_time_over_http_with_iso_dates(db):
     from datetime import datetime, timedelta
 
     from app.main import app
-    app.state.ledger = led = Ledger(db)
+    app.state.ledger = led = Ledger(db.dsn, schema=db.schema)
     a = acct(led, "Alice")
     last_week = datetime.now() - timedelta(days=7)
     led.deposit(a, 400, at=last_week.timestamp())
@@ -130,7 +146,7 @@ def test_r5_a_crash_mid_write_leaves_no_partial_transaction(L, monkeypatch):
         # write the first leg, then "crash" before the second
         con.execute("INSERT INTO transactions (id, kind, ts) VALUES ('tx_partial', 'transfer', 0)")
         con.execute("INSERT INTO entries (txn_id, account_id, amount, currency, version, ts) "
-                    "VALUES ('tx_partial', ?, -5000, 'INR', 2, 0)", (a,))
+                    "VALUES ('tx_partial', %s, -5000, 'INR', 2, 0)", (a,))
         raise RuntimeError("power cut")
 
     monkeypatch.setattr(L, "_append", exploding_append)
@@ -216,7 +232,7 @@ def test_r7_random_concurrent_transfers_keep_every_invariant(L):
 
 
 def _proc_transfers(db, a, b, n):
-    led = Ledger(db)
+    led = Ledger(db.dsn, schema=db.schema, pool_size=4)
     ok = 0
     for _ in range(n):
         try:

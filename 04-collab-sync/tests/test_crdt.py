@@ -5,12 +5,26 @@ import random
 import shutil
 import subprocess
 
+import uuid
+
+import psycopg
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from app.rga import RGA, op_key
-from app.store import DocStore
+from app.store import DEFAULT_DSN, DocStore
+
+DSN = os.getenv("COLLAB_DSN", DEFAULT_DSN)
+
+
+@pytest.fixture
+def pg_schema():
+    """A fresh Postgres schema per test for the op log."""
+    name = f"test_{uuid.uuid4().hex[:10]}"
+    yield name
+    with psycopg.connect(DSN, autocommit=True) as con:
+        con.execute(f'DROP SCHEMA IF EXISTS "{name}" CASCADE')
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JS_RGA = os.path.join(ROOT, "..", "frontend", "src", "lib", "rga.js")
@@ -141,8 +155,8 @@ def test_r3_offline_client_merges_without_losing_anyones_work():
 
 
 # ---- R4: history and revert ------------------------------------------------------------------------
-def test_r4_revert_to_any_point_and_revert_the_revert(tmp_path):
-    store = DocStore(str(tmp_path / "c.db"))
+def test_r4_revert_to_any_point_and_revert_the_revert(pg_schema):
+    store = DocStore(DSN, pg_schema)
     a = RGA("a")
     store.append("d", a.insert(0, "hello world"))
     seq_hello = store.seq["d"]
@@ -166,17 +180,17 @@ def test_r4_revert_to_any_point_and_revert_the_revert(tmp_path):
     assert store.at("d", store.seq["d"]).text() == store.doc("d").text()
 
 
-def test_r4_history_survives_server_restart(tmp_path):
-    path = str(tmp_path / "c.db")
-    s1 = DocStore(path)
+def test_r4_history_survives_server_restart(pg_schema):
+    s1 = DocStore(DSN, pg_schema)
     a = RGA("a")
     s1.append("d", a.insert(0, "persist me"))
-    s2 = DocStore(path)
+    s1.close()  # "server restart": a new process would start from the log alone
+    s2 = DocStore(DSN, pg_schema)
     assert s2.doc("d").text() == "persist me" and s2.seq["d"] == 10
 
 
-def test_r7_resent_ops_are_stored_once(tmp_path):
-    store = DocStore(str(tmp_path / "c.db"))
+def test_r7_resent_ops_are_stored_once(pg_schema):
+    store = DocStore(DSN, pg_schema)
     a = RGA("a")
     ops = a.insert(0, "abc")
     assert len(store.append("d", ops)) == 3

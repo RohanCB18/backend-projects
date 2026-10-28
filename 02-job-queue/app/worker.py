@@ -3,7 +3,7 @@
 Workers run either as threads inside the API process (easy to show in the UI)
 or as separate OS processes:
 
-    python -m app.worker --id w-ext-1
+    python -m app.worker --id w-ext-1          (uses JQ_DSN, or the docker-compose Postgres)
 
 A separate process is what the crash test kills for real.
 """
@@ -20,7 +20,7 @@ import time
 import traceback
 
 from .handlers import HANDLERS, Ctx, LeaseLost, WorkerCrash
-from .queue import JobQueue
+from .queue import DEFAULT_DSN, JobQueue
 
 
 class Worker(threading.Thread):
@@ -129,7 +129,7 @@ class WorkerPool:
             if not w.is_alive():
                 del self.workers[wid]
         self.q.store.tx(lambda con: con.execute(
-            "DELETE FROM workers WHERE status IN ('crashed', 'stopped') OR last_seen < ?", (time.time() - 30,)))
+            "DELETE FROM workers WHERE status IN ('crashed', 'stopped') OR last_seen < %s", (time.time() - 30,)))
 
     def shutdown(self) -> None:
         for w in self.workers.values():
@@ -138,8 +138,8 @@ class WorkerPool:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    p.add_argument("--db", default=os.getenv("JQ_DB", os.path.join(here, "data", "jobqueue.db")))
+    p.add_argument("--dsn", default=os.getenv("JQ_DSN", DEFAULT_DSN))
+    p.add_argument("--schema", default=os.getenv("JQ_SCHEMA", "public"))
     p.add_argument("--id", default=f"proc-{os.getpid()}")
     p.add_argument("--lease", type=float, default=float(os.getenv("JQ_LEASE", "5")))
     p.add_argument("--backoff", type=float, default=float(os.getenv("JQ_BACKOFF", "1")))
@@ -147,8 +147,9 @@ def main() -> None:
     if sys.platform == "win32":
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
-    w = Worker(JobQueue(a.db, lease_seconds=a.lease, base_backoff=a.backoff), a.id, kind="process")
-    print(f"[{a.id}] worker process {os.getpid()} polling {a.db}", flush=True)
+    q = JobQueue(a.dsn, lease_seconds=a.lease, base_backoff=a.backoff, schema=a.schema, pool_size=4)
+    w = Worker(q, a.id, kind="process")
+    print(f"[{a.id}] worker process {os.getpid()} polling Postgres (schema {a.schema})", flush=True)
     w.run()
 
 

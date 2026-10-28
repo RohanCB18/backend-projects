@@ -1,7 +1,9 @@
-# 03 · Event-Sourced Ledger (Double-Entry Bank Core)
+# 03 · Event-Sourced Ledger (Double-Entry Bank Core, Postgres)
 
 Money modelled the way banks do: an immutable stream of balanced events.
-There is no balance column anywhere.
+There is no balance column anywhere. Events live in Postgres
+(`docker compose up -d --wait` in the repo root; database `ledger` on
+127.0.0.1:15432, or set `LEDGER_DSN`).
 
 ```bash
 ..\.venv\Scripts\python -m uvicorn app.main:app --port 9103
@@ -25,16 +27,22 @@ Try `POST /demo/seed` for 5 accounts with 30 days of back-dated history, then
 
 ## Design decisions
 
-* **Append-only, enforced by the database.** SQL triggers reject every UPDATE
-  and DELETE on `entries` and `transactions`; even a bug can't rewrite history.
+* **Append-only, enforced by the database.** Postgres triggers reject every
+  UPDATE, DELETE and TRUNCATE on `entries` and `transactions`; even a bug (or a
+  person with a SQL console) can't rewrite history.
 * **Derived balances.** `balance = latest snapshot + sum(entries after it)`.
   Snapshots (every 5 entries) are just a cache, checked against full replays.
 * **Point-in-time** = the same fold, limited to entries with `ts ≤ T`.
 * **Atomic.** Validate first; then all legs go in one transaction or none do.
 * **Optimistic concurrency.** Read each account's (version, balance) without
-  locks, check the rules, then append only if every version is unchanged. If
-  someone moved money in between, re-read and retry. A `pessimistic` mode (lock
-  first) and a deliberately broken `naive` mode exist for the race demo.
+  locks and check the rules (this can be slow: a fraud check, a network call).
+  Then, in one short transaction, row-lock the touched accounts and append only
+  if every version is still the one we read. If someone moved money in between,
+  re-read and retry. Locks are always taken in sorted account order, so two
+  transfers A→B and B→A can't deadlock, and they're held only for the
+  milliseconds of the append. `UNIQUE(account, version)` is the safety net.
+  A `pessimistic` mode (lock first, then read + check + write) and a
+  deliberately broken `naive` mode (no re-check) exist for the race demo.
 * **Stretch: multi-currency.** A USD→INR transfer goes through FX pool accounts
   (`A −10 USD, fx:USD +10 USD, fx:INR −832.50 INR, B +832.50 INR`) so each
   currency still nets to zero. Also idempotency keys on transfers.

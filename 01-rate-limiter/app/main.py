@@ -18,32 +18,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .sqlite_backend import SQLiteLimiter
+from redis.asyncio import BlockingConnectionPool, Redis
+
+from .limiter import RateLimiter
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BACKEND = os.getenv("RL_BACKEND", "sqlite")  # "sqlite" (default) or "redis"
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:16380/0")
 
 
-def make_limiter():
-    if BACKEND == "redis":
-        from redis.asyncio import BlockingConnectionPool, Redis
-
-        from .redis_backend import RedisLimiter
-
-        url = os.getenv("REDIS_URL", "redis://localhost:6380/0")
-        pool = BlockingConnectionPool.from_url(url, decode_responses=True, max_connections=40, timeout=10)
-        return RedisLimiter(Redis(connection_pool=pool), prefix=os.getenv("RL_PREFIX", "rl:"))
-    return SQLiteLimiter(os.getenv("RL_DB", os.path.join(HERE, "data", "ratelimiter.db")))
+def make_limiter() -> RateLimiter:
+    # A bounded pool: under load, requests wait briefly for a free connection
+    # instead of opening hundreds of new sockets at once.
+    pool = BlockingConnectionPool.from_url(REDIS_URL, decode_responses=True, max_connections=50, timeout=10)
+    return RateLimiter(Redis(connection_pool=pool), prefix=os.getenv("RL_PREFIX", "rl:"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if sys.platform == "win32":
-        # Windows sleeps/timeouts default to 15.6 ms ticks; ask for 1 ms so
-        # short waits (thread hand-offs, busy retries) don't cost a whole tick.
+        # Windows sleeps/timeouts default to 15.6 ms ticks; ask for 1 ms.
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
     app.state.limiter = make_limiter()
+    await app.state.limiter.ping()  # fail fast if Redis isn't up
     yield
     await app.state.limiter.close()
 
@@ -54,7 +51,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
                                    "X-RateLimit-Mode", "Retry-After"])
 
 
-def limiter(request: Request):
+def limiter(request: Request) -> RateLimiter:
     return request.app.state.limiter
 
 
@@ -147,4 +144,4 @@ async def loadtest(body: LoadTestBody):
 
 @app.get("/health")
 async def health(request: Request):
-    return {"ok": await limiter(request).ping(), "backend": BACKEND}
+    return {"ok": await limiter(request).ping(), "backend": "redis"}

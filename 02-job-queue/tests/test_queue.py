@@ -7,23 +7,43 @@ import sys
 import threading
 import time
 
+import uuid
+from typing import NamedTuple
+
 import httpx
+import psycopg
 import pytest
 
-from app.queue import JobQueue
+from app.queue import DEFAULT_DSN, JobQueue
 from app.worker import Worker, WorkerPool
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DSN = os.getenv("JQ_DSN", DEFAULT_DSN)
+
+
+class Db(NamedTuple):
+    dsn: str
+    schema: str
 
 
 @pytest.fixture
-def db(tmp_path):
-    return str(tmp_path / "jq.db")
+def db():
+    """A fresh Postgres schema per test: same tables, nothing shared."""
+    d = Db(DSN, f"test_{uuid.uuid4().hex[:10]}")
+    yield d
+    # stop any worker threads the test started BEFORE their tables disappear
+    workers = [t for t in threading.enumerate() if isinstance(t, Worker)]
+    for w in workers:
+        w.stop_requested = True
+    for w in workers:
+        w.join(timeout=15)
+    with psycopg.connect(DSN, autocommit=True) as con:
+        con.execute(f'DROP SCHEMA IF EXISTS "{d.schema}" CASCADE')
 
 
 @pytest.fixture
 def q(db):
-    return JobQueue(db, lease_seconds=0.5, base_backoff=0.1)
+    return JobQueue(db.dsn, lease_seconds=0.5, base_backoff=0.1, schema=db.schema)
 
 
 def wait_until(pred, timeout=15.0, step=0.05):
@@ -39,7 +59,7 @@ def wait_until(pred, timeout=15.0, step=0.05):
 def test_r1_jobs_survive_a_restart(db, q):
     ids = [q.enqueue("send_email")["id"] for _ in range(3)]
     del q  # "crash": the process's memory is gone
-    fresh = JobQueue(db)
+    fresh = JobQueue(db.dsn, schema=db.schema)
     assert [j["id"] for j in fresh.jobs(status="queued")] == sorted(ids, reverse=True)
     assert fresh.claim("w")["id"] == ids[0]
 
@@ -63,7 +83,7 @@ def test_r2_delayed_job_is_invisible_until_due(q):
 
 # ---- R3: retries with exponential backoff -------------------------------------
 def test_r3_backoff_doubles_with_jitter_and_is_capped(db):
-    q = JobQueue(db, base_backoff=1.0, max_backoff=8.0, jitter=0.2)
+    q = JobQueue(db.dsn, schema=db.schema, base_backoff=1.0, max_backoff=8.0, jitter=0.2)
     for attempt, base in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 8), (9, 8)]:
         samples = [q.backoff(attempt) for _ in range(200)]
         assert all(base * 0.8 <= s <= base * 1.2 for s in samples)
@@ -127,7 +147,9 @@ def test_r5_heartbeat_keeps_a_long_job_owned(q):
     assert q.claim("B") is None
 
 
-def test_r5_concurrent_threads_never_claim_the_same_job(q):
+def test_r5_concurrent_threads_never_claim_the_same_job(db):
+    # long lease: we claim without completing, and must not let leases expire mid-test
+    q = JobQueue(db.dsn, schema=db.schema, lease_seconds=60)
     n = 300
     for _ in range(n):
         q.enqueue("send_email")
@@ -147,8 +169,8 @@ def test_r5_concurrent_threads_never_claim_the_same_job(q):
     assert len(claimed) == n and len(set(claimed)) == n
 
 
-def _claim_all(db: str, name: str, start_at: float) -> list[int]:
-    q = JobQueue(db, lease_seconds=60)
+def _claim_all(db: Db, name: str, start_at: float) -> list[int]:
+    q = JobQueue(db.dsn, schema=db.schema, lease_seconds=60)
     time.sleep(max(0.0, start_at - time.time()))  # all processes start claiming together
     out = []
     while (job := q.claim(name)) is not None:
@@ -170,9 +192,10 @@ def test_r5_concurrent_processes_never_claim_the_same_job(db, q):
 
 def test_r5_worker_process_killed_mid_job_is_recovered(db):
     """The real thing: a separate OS process holding the job is killed."""
-    q = JobQueue(db, lease_seconds=1.0, base_backoff=0.1)
+    q = JobQueue(db.dsn, schema=db.schema, lease_seconds=1.0, base_backoff=0.1)
     j = q.enqueue("slow", {"duration": 2.0})
-    proc = subprocess.Popen([sys.executable, "-m", "app.worker", "--db", db, "--id", "victim", "--lease", "1"],
+    proc = subprocess.Popen([sys.executable, "-m", "app.worker", "--dsn", db.dsn, "--schema", db.schema,
+                             "--id", "victim", "--lease", "1"],
                             cwd=ROOT)
     try:
         assert wait_until(lambda: q.job(j["id"])["lease_owner"] == "victim", timeout=20)
@@ -196,7 +219,7 @@ def test_r5_worker_process_killed_mid_job_is_recovered(db):
 # ---- R6: inspection ------------------------------------------------------------
 async def test_r6_stats_dlq_and_inflight_are_exposed_over_http(db):
     from app.main import app
-    q = JobQueue(db, lease_seconds=30)
+    q = JobQueue(db.dsn, schema=db.schema, lease_seconds=30)
     app.state.q, app.state.pool, app.state.procs = q, WorkerPool(q), {}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         for _ in range(3):
@@ -207,7 +230,7 @@ async def test_r6_stats_dlq_and_inflight_are_exposed_over_http(db):
         stats = (await c.get("/stats")).json()
         assert stats["running"] == 1 and stats["ready"] == 3 and stats["scheduled"] == 1
         assert stats["in_flight"][0]["lease_owner"] == "w1"
-        q.store.tx(lambda con: con.execute("UPDATE jobs SET status='dead' WHERE id=?", (bad["id"],)))
+        q.store.tx(lambda con: con.execute("UPDATE jobs SET status='dead' WHERE id=%s", (bad["id"],)))
         assert [d["id"] for d in (await c.get("/dlq")).json()] == [bad["id"]]
         assert (await c.post(f"/dlq/{bad['id']}/replay")).status_code == 200
 

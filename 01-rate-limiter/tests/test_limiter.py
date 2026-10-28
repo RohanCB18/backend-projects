@@ -1,7 +1,7 @@
 """Each test maps to a requirement from the spec (R1..R7).
 
-Every test runs against both storage backends. The Redis run is skipped
-automatically when no Redis is reachable (docker compose up -d redis).
+Needs Redis on 127.0.0.1:16380 (docker compose up -d). Every test uses its own
+key prefix, so tests never see each other's buckets.
 """
 import asyncio
 import multiprocessing as mp
@@ -10,41 +10,30 @@ import uuid
 
 import httpx
 import pytest
+from redis.asyncio import Redis
 
+from app.limiter import RateLimiter
 from app.main import app
-from app.sqlite_backend import SQLiteLimiter
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380/0")
-
-
-def _redis_available() -> bool:
-    try:
-        import redis
-        return redis.Redis.from_url(REDIS_URL, socket_connect_timeout=0.5).ping()
-    except Exception:
-        return False
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:16380/0")
 
 
-@pytest.fixture(params=["sqlite", "redis"])
-async def make(request, tmp_path):
-    """Returns a factory: calling it twice gives two independent limiter objects
-    over the SAME storage, which is how we simulate a restart."""
-    if request.param == "sqlite":
-        db = str(tmp_path / "rl.db")
-        yield lambda: SQLiteLimiter(db)
-        return
-    if not _redis_available():
-        pytest.skip("Redis not reachable")
-    from redis.asyncio import Redis
+@pytest.fixture
+def prefix():
+    return f"test:{uuid.uuid4().hex[:8]}:"
 
-    from app.redis_backend import RedisLimiter
-    prefix = f"test:{uuid.uuid4().hex[:8]}:"
+
+@pytest.fixture
+async def make(prefix):
+    """Factory: each call gives a NEW limiter with its own Redis connection over
+    the same keys. Two of them = the service before and after a restart, or two
+    instances of the service."""
     clients = []
 
     def factory():
-        r = Redis.from_url(REDIS_URL, decode_responses=True)
+        r = Redis.from_url(REDIS_URL, decode_responses=True, max_connections=500)
         clients.append(r)
-        return RedisLimiter(r, prefix)
+        return RateLimiter(r, prefix)
 
     yield factory
     keys = [k async for k in clients[0].scan_iter(f"{prefix}*")]
@@ -80,12 +69,12 @@ async def test_r2_limits_are_per_client(lim):
     assert [(await lim.check("big")).allowed for _ in range(3)] == [True, True, True]
 
 
-async def test_r3_state_survives_a_restart(make):
+async def test_r3_state_survives_a_service_restart(make):
     first = make()
     await first.set_config("a", {"rate": 0.001, "burst": 3})
     for _ in range(3):
         await first.check("a")
-    # "restart": a brand-new limiter object; nothing shared in memory
+    # "restart": a brand-new limiter + connection; nothing shared in Python memory
     fresh = make()
     assert not (await fresh.check("a")).allowed
     assert (await fresh.get_config("a"))["burst"] == 3
@@ -97,19 +86,23 @@ async def test_r4_concurrent_requests_never_double_spend(lim):
     assert sum(d.allowed for d in results) == 50  # exactly the burst, never 51
 
 
-def _hammer(db: str, n: int) -> int:
-    lim = SQLiteLimiter(db)
-    return sum(lim.check_sync("hot").allowed for _ in range(n))
+def _hammer(prefix: str, n: int) -> int:
+    async def go():
+        r = Redis.from_url(REDIS_URL, decode_responses=True)
+        lim = RateLimiter(r, prefix)
+        out = sum([(d.allowed) for d in await asyncio.gather(*(lim.check("hot") for _ in range(n)))])
+        await r.aclose()
+        return out
+    return asyncio.run(go())
 
 
-def test_r4_no_double_spend_across_processes(tmp_path):
-    """Four separate OS processes share one database file, like four limiter
-    instances would. The in-process lock can't help here; only the database's
-    transaction lock can."""
-    db = str(tmp_path / "rl.db")
-    SQLiteLimiter(db).set_config_sync("hot", {"rate": 0.0001, "burst": 120})
+async def test_r4_no_double_spend_across_service_instances(make, prefix):
+    """Four OS processes = four instances of the limiter sharing one Redis
+    (the distributed-mode stretch goal). Only Redis's atomic script can keep
+    them from double-spending."""
+    await make().set_config("hot", {"rate": 0.0001, "burst": 120})
     with mp.get_context("spawn").Pool(4) as pool:
-        allowed = sum(pool.starmap(_hammer, [(db, 100)] * 4))
+        allowed = sum(pool.starmap(_hammer, [(prefix, 100)] * 4))
     assert allowed == 120
 
 
